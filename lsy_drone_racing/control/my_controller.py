@@ -49,7 +49,6 @@ class TrajectoryController(Controller):
         self.obstacles_flags = [False] * len(obs["obstacles_visited"])
         self.index_gate = 0
 
-
         self.waypoints = np.array(
             [
                 self.initial_pos,

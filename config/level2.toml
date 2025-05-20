@@ -18,6 +18,7 @@ practice_without_track_objects = false
 id = 91
 channel = 100
 
+
 [sim]
 # Physics options: analytical, sys_id, mujoco
 physics = "analytical"
