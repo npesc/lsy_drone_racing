@@ -39,7 +39,7 @@ class TrajectoryController(Controller):
         """
         super().__init__(obs, info, config)
         # Same waypoints as in the trajectory controller. Determined by trial and error.
-        self.t_total = 12
+        self.t_total = 10
         self._tick = 0
         self._freq = config.env.freq
         self.obstacle_size = 0.05
@@ -70,7 +70,7 @@ class TrajectoryController(Controller):
         distances = np.linalg.norm(self.waypoints - self.gates_pos[gate_index], axis=1)
         
         # Identify indices of waypoints within a 0.5 radius
-        waypoints_to_replace = np.where(distances <= 0.5)[0]
+        waypoints_to_replace = np.where(distances <= 0.4)[0]
 
         # Get gate orientation and forward direction
         rotation = R.from_quat(self.gates_quat[gate_index])
@@ -93,6 +93,15 @@ class TrajectoryController(Controller):
                 after_gate[np.newaxis, :]-[0.2 , 0.0 , 0.0],  # Insert after_gate
                 self.waypoints[last_idx:]  # Keep waypoints after affected region
             ))
+            elif gate_index == 2:
+                after_gate = center_of_gate + 0.1 * gate_forward  # Exit position
+                self.waypoints = np.vstack((
+                    self.waypoints[:first_idx],  # Keep waypoints before affected region
+                    before_gate[np.newaxis, :] + [0.1, 0.0, 0.0],  # Insert before_gate
+                    center_of_gate[np.newaxis, :],  # Insert gate center
+                    after_gate[np.newaxis, :],  # Insert after_gate
+                    self.waypoints[last_idx:]  # Keep waypoints after affected region
+            ))
             else : 
             # Update waypoints to ensure the drone passes through the center
                 self.waypoints = np.vstack((
@@ -109,12 +118,12 @@ class TrajectoryController(Controller):
 
     def update_obstacle_trajectory(self, obstacle_index: int):
         """Update the trajectory for a visited obstacle."""
-        marge = 0.075
+        marge = 0.1
         distances = np.linalg.norm(self.waypoints[:,:2] - self.obstacles[obstacle_index,:2], axis=1)
         index_obstacle = np.argmin(distances)
         #print(f"{distances}")
         
-        if distances[index_obstacle] <= self.obstacle_size - 0.2 :
+        if distances[index_obstacle] <= self.obstacle_size :
             # Calculate midpoint and adjust direction
             before_point = self.waypoints[index_obstacle[0] - 1]
             after_point = self.waypoints[index_obstacle[0] + 1]
@@ -124,7 +133,7 @@ class TrajectoryController(Controller):
             direction /= np.linalg.norm(direction)
             direction_3d = np.array([-direction[1], direction[0], 0.0])
             # Move the waypoint slightly around the obstacle
-            adjustment = self.obstacle_size * 1.2 * direction_3d
+            adjustment = self.obstacle_size * 1 * direction_3d
             adjusted_waypoint = obstacle_pos + adjustment
             self.waypoints[index_obstacle] = adjusted_waypoint
         self.generate_trajectory()
@@ -164,6 +173,7 @@ class TrajectoryController(Controller):
         for i, visited in enumerate(self.obstacles_visited):
             if visited and not self.obstacles_flags[i] :
                 self.update_obstacle_trajectory(i)
+                self.obstacles_flags[i] = True
         
 
         tau = min(self._tick / self._freq, self.t_total)
