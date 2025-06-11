@@ -20,6 +20,8 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 
+from scipy.optimize import minimize
+
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -39,7 +41,7 @@ class TrajectoryController(Controller):
         """
         super().__init__(obs, info, config)
         # Same waypoints as in the trajectory controller. Determined by trial and error.
-        self.t_total = 12
+        self.t_total = 10.5
         self._tick = 0
         self._freq = config.env.freq
         self.obstacle_size = 0.05
@@ -57,10 +59,14 @@ class TrajectoryController(Controller):
                 [0.2, -1.3, 0.65],
                 [1.1, -0.85, 1.1],
                 [0.2, 0.5, 0.65],
-                [0.0, 1.2, 0.525],
-                [0.0, 1.1, 1.1],
-                [-0.5, 0.0, 1.1],
-                [-0.5, -0.5, 1.1],
+                obs["gates_pos"][2] + [0.1, 0, 0.3],
+                obs["gates_pos"][2] + [0.1, 0.15, 0.3],
+                obs["obstacles_pos"][3] + [0.4, 0.3, -0.2],
+                obs["obstacles_pos"][3] + [0.4, 0, -0.2],
+                # [-0.3, 0.0, 0.5],
+                # [-0.4, -0.5, 1.1],
+                obs["gates_pos"][3],
+                obs["gates_pos"][3] + [0, -0.5, 0],
             ]
         )
         self.generate_trajectory()
@@ -75,7 +81,7 @@ class TrajectoryController(Controller):
         # Get gate orientation and forward direction
         rotation = R.from_quat(self.gates_quat[gate_index])
         gate_forward = rotation.apply([0, 1, 0])  # Gate's forward direction in local frame
-        #print(f"{gate_forward}")
+        # print(f"{gate_forward}")
         # Define positions for before and after the gate to guide through the center
         center_of_gate = self.gates_pos[gate_index]  # Center of the gate
         before_gate = center_of_gate - 0.3 * gate_forward  # Approach position
@@ -85,13 +91,24 @@ class TrajectoryController(Controller):
         if len(waypoints_to_replace) > 0:
             first_idx = waypoints_to_replace[0]
             last_idx = waypoints_to_replace[-1] + 1
-            if gate_index == 1 : 
+
+            # Special handling for gate 1 (second gate, index=1): add X-offset to exit
+            if gate_index == 1:
                 self.waypoints = np.vstack((
-                self.waypoints[:first_idx],  # Keep waypoints before affected region
-                before_gate[np.newaxis, :],  # Insert before_gate
-                center_of_gate[np.newaxis, :],  # Insert gate center
-                after_gate[np.newaxis, :]-[0.2 , 0.0 , 0.0],  # Insert after_gate
-                self.waypoints[last_idx:]  # Keep waypoints after affected region
+                    self.waypoints[:first_idx],  # Keep waypoints before affected region
+                    before_gate[np.newaxis, :],  # Insert before_gate
+                    center_of_gate[np.newaxis, :],  # Insert gate center
+                    after_gate[np.newaxis, :]-[0.2 , 0.0 , 0.0],  # Insert after_gate
+                    self.waypoints[last_idx:]  # Keep waypoints after affected region
+            ))
+            elif gate_index == 2:
+                after_gate = center_of_gate + 0.1 * gate_forward  # Exit position
+                self.waypoints = np.vstack((
+                    self.waypoints[:first_idx],  # Keep waypoints before affected region
+                    before_gate[np.newaxis, :],  # Insert before_gate
+                    center_of_gate[np.newaxis, :],  # Insert gate center
+                    after_gate[np.newaxis, :]-[0.2 , 0.0 , 0.0],  # Insert after_gate
+                    self.waypoints[last_idx:]  # Keep waypoints after affected region
             ))
             else : 
             # Update waypoints to ensure the drone passes through the center
@@ -116,8 +133,8 @@ class TrajectoryController(Controller):
         
         if distances[index_obstacle] <= self.obstacle_size - 0.2 :
             # Calculate midpoint and adjust direction
-            before_point = self.waypoints[index_obstacle[0] - 1]
-            after_point = self.waypoints[index_obstacle[0] + 1]
+            before_point = self.waypoints[index_obstacle - 1]
+            after_point = self.waypoints[index_obstacle + 1]
             obstacle_pos = self.obstacles[obstacle_index]
 
             direction = after_point[:2] - before_point[:2]
@@ -126,7 +143,9 @@ class TrajectoryController(Controller):
             # Move the waypoint slightly around the obstacle
             adjustment = self.obstacle_size * 1.2 * direction_3d
             adjusted_waypoint = obstacle_pos + adjustment
-            self.waypoints[index_obstacle] = adjusted_waypoint
+
+            adjusted_wp = self.replan_waypoint(self.waypoints[index_obstacle], obstacle_pos, safety_radius=0.3)
+            self.waypoints[index_obstacle] = adjusted_wp
         self.generate_trajectory()
 
     def generate_trajectory(self):
@@ -171,6 +190,26 @@ class TrajectoryController(Controller):
         if tau == self.t_total:  # Maximum duration reached
             self._finished = True
         return np.concatenate((target_pos, np.zeros(10)), dtype=np.float32)
+    
+    def replan_waypoint(x0, obstacle_center, safety_radius):
+        """
+        Adjusts a 2D waypoint to avoid a circular obstacle using constrained optimization.
+        """
+        def objective(x):
+            return np.sum((x - x0) ** 2)  # Minimize distance from original point
+
+        def constraint(x):
+            return np.linalg.norm(x - obstacle_center) - safety_radius  # Must be outside safety circle
+
+        cons = {'type': 'ineq', 'fun': constraint}
+
+        result = minimize(objective, x0, constraints=cons, method='SLSQP')
+
+        if result.success:
+            return result.x
+        else:
+            print("Replanning failed:", result.message)
+            return x0  # fallback to original
 
     def step_callback(
         self,
