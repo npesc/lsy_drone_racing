@@ -15,9 +15,10 @@ from typing import TYPE_CHECKING
 
 import fire
 import gymnasium
+import numpy as np
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
-from lsy_drone_racing.utils import load_config, load_controller
+from lsy_drone_racing.utils import draw_line, load_config, load_controller
 
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+SOLID_RED = np.array([1.0, 0, 0, 1.0])
+LIGHT_BLUE = np.array([0.3, 0.3, 1.0, 0.7])
 
 
 def simulate(
@@ -93,6 +97,7 @@ def simulate(
             # Synchronize the GUI.
             if config.sim.gui:
                 if ((i * fps) % config.env.freq) < fps:
+                    draw_line(env=env, points=controller.waypoints, rgba=LIGHT_BLUE)
                     env.render()
             i += 1
 
