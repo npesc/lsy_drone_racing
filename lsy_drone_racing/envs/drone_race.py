@@ -9,6 +9,7 @@ from gymnasium import Env
 from gymnasium.vector import VectorEnv
 from gymnasium.vector.utils import batch_space
 from packaging.version import Version
+import numpy as np
 
 from lsy_drone_racing.envs.race_core import RaceCoreEnv, build_action_space, build_observation_space
 
@@ -82,7 +83,7 @@ class DroneRaceEnv(RaceCoreEnv, Env):
         """
         obs, info = self._reset(seed=seed, options=options)
         obs = {k: v[0, 0] for k, v in obs.items()}
-        info = {k: v[0, 0] for k, v in info.items()}
+        info = {k: v[0, 0] if isinstance(v, np.ndarray) and v.ndim >= 2 else v for k, v in info.items()}
         return obs, info
 
     def step(self, action: Array) -> tuple[dict, float, bool, bool, dict]:
@@ -96,8 +97,12 @@ class DroneRaceEnv(RaceCoreEnv, Env):
         """
         obs, reward, terminated, truncated, info = self._step(action)
         obs = {k: v[0, 0] for k, v in obs.items()}
-        info = {k: v[0, 0] for k, v in info.items()}
-        return obs, float(reward[0, 0]), bool(terminated[0, 0]), bool(truncated[0, 0]), info
+        info = {k: v[0, 0] if isinstance(v, np.ndarray) and v.ndim >= 2 else v for k, v in info.items()}
+        # Robustly extract scalar from reward/terminated/truncated
+        reward = np.asarray(reward).flatten()[0]
+        terminated = np.asarray(terminated).flatten()[0]
+        truncated = np.asarray(truncated).flatten()[0]
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
 
 class VecDroneRaceEnv(RaceCoreEnv, VectorEnv):
