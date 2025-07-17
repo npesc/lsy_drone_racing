@@ -22,6 +22,8 @@ from lsy_drone_racing.control import Controller
 
 from scipy.optimize import minimize
 
+import minsnap_trajectories as ms
+
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -41,7 +43,7 @@ class TrajectoryController(Controller):
         """
         super().__init__(obs, info, config)
         # Same waypoints as in the trajectory controller. Determined by trial and error.
-        self.t_total = 10
+        self.t_total = 9
         self._tick = 0
         self._freq = config.env.freq
         self.obstacle_size = 0.05
@@ -53,20 +55,25 @@ class TrajectoryController(Controller):
 
         self.waypoints = np.array(
             [
+                # Find more optimal waypoints 
                 self.initial_pos,
                 [0.8, 1.0, 0.3],
                 [0.55, -0.3, 0.5],
                 [0.2, -1.3, 0.65],
                 [1.1, -0.85, 1.1],
                 [0.2, 0.5, 0.65],
-                obs["gates_pos"][2] + [0.1, 0, 0.3],
-                obs["gates_pos"][2] + [0.1, 0.15, 0.3],
-                obs["obstacles_pos"][3] + [0.4, 0.3, -0.2],
-                obs["obstacles_pos"][3] + [0.4, 0, -0.2],
+                # obs[]
+                obs["gates_pos"][2] + [+0.2, -0.3, 0],
+                obs["obstacles_pos"][2] + [0.2, -0.5, -1],
+                # obs["gates_pos"][2] + [0.1, 0.15, 0.3],
+                # obs["obstacles_pos"][3] + [0.4, 0.3, -0.2],
+                # obs["obstacles_pos"][3] + [0.4, -0.6, -0.2],
                 # [-0.3, 0.0, 0.5],
                 # [-0.4, -0.5, 1.1],
-                obs["gates_pos"][3],
-                obs["gates_pos"][3] + [0, -0.5, 0],
+                # obs["gates_pos"][3] -,
+                obs["gates_pos"][3] + [0, -0.3, 0],
+                obs["gates_pos"][3] + [-0, -0.4, 0],
+                obs["gates_pos"][3] + [0.1, -0.4, 0],
             ]
         )
         self.generate_trajectory()
@@ -102,19 +109,10 @@ class TrajectoryController(Controller):
                     self.waypoints[last_idx:]  # Keep waypoints after affected region
             ))
             elif gate_index == 2:
-                after_gate = center_of_gate + 0.1 * gate_forward  # Exit position
+                after_gate = center_of_gate + 0.05 * gate_forward  # Exit position
                 self.waypoints = np.vstack((
                     self.waypoints[:first_idx],  # Keep waypoints before affected region
-                    before_gate[np.newaxis, :],  # Insert before_gate
-                    center_of_gate[np.newaxis, :],  # Insert gate center
-                    after_gate[np.newaxis, :]-[0.2 , 0.0 , 0.0],  # Insert after_gate
-                    self.waypoints[last_idx:]  # Keep waypoints after affected region
-            ))
-            elif gate_index == 2:
-                after_gate = center_of_gate + 0.1 * gate_forward  # Exit position
-                self.waypoints = np.vstack((
-                    self.waypoints[:first_idx],  # Keep waypoints before affected region
-                    before_gate[np.newaxis, :] + [0.1, 0.0, 0.0],  # Insert before_gate
+                    before_gate[np.newaxis, :] + [0.1, -0.1, 0.0],  # Insert before_gate -[0.2 , 0.0 , 0.0]
                     center_of_gate[np.newaxis, :],  # Insert gate center
                     after_gate[np.newaxis, :],  # Insert after_gate
                     self.waypoints[last_idx:]  # Keep waypoints after affected region
@@ -159,7 +157,16 @@ class TrajectoryController(Controller):
 
     def generate_trajectory(self):
         t = np.linspace(0, self.t_total, len(self.waypoints))
-        self.trajectory = CubicSpline(t, self.waypoints)
+        # Build minsnap Waypoint objects
+        refs = [ms.Waypoint(time=ti, position=pos) for ti, pos in zip(t, self.waypoints)]
+        # Generate minsnap trajectory (degree=5 for fast/safe, or 7/8 for more smoothness)
+        self.minsnap_traj = ms.generate_trajectory(
+            refs,
+            degree=6,
+            idx_minimized_orders=(4,),
+            num_continuous_orders=3,
+            algorithm="closed-form",
+        )
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -196,7 +203,9 @@ class TrajectoryController(Controller):
         
 
         tau = min(self._tick / self._freq, self.t_total)
-        target_pos = self.trajectory(tau)
+        # Sample minsnap trajectory at time tau
+        pva = ms.compute_trajectory_derivatives(self.minsnap_traj, np.array([tau]), 1)
+        target_pos = pva[0, 0]  # position at time tau
         if tau == self.t_total:  # Maximum duration reached
             self._finished = True
         return np.concatenate((target_pos, np.zeros(10)), dtype=np.float32)
