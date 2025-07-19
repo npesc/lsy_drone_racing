@@ -4,7 +4,8 @@ from stable_baselines3 import PPO
 from pathlib import Path
 from stable_baselines3.common.callbacks import CheckpointCallback
 
-MODEL_PATH = Path(__file__).parents[2] / "ppo_drone_racing.zip"  # Adjust if needed
+# MODEL_PATH = Path(__file__).parents[2] / "ppo_drone_racing.zip"  # Adjust if needed
+MODEL_PATH = Path(__file__).parents[2] / "checkpoints/ppo_att_center/ppo_att_center.zip"  # Adjust if needed
 
 class RLController(Controller):
     def __init__(self, obs, info, config):

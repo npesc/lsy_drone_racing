@@ -24,7 +24,7 @@ N_ENVS = 1  # Number of parallel environments for GPU training
 
 # --- Reward config ---
 STEP_PENALTY = -0.01
-DISTANCE_PENALTY_COEFF = -0.1
+DISTANCE_PENALTY_COEFF = 0.1  # Positive: penalizes distance from gate center
 
 # --- Load config and environment ---
 config = load_config(Path(CONFIG_PATH))
