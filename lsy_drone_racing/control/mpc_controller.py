@@ -13,11 +13,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import scipy
-from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver, casadi_length, is_empty
-from casadi import MX, cos, sin, vertcat, fmin,fmax
+from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
+from casadi import MX, cos, sin, vertcat, horzcat,  if_else, fmax, fmin, sqrt
 from scipy.interpolate import CubicSpline
-import minsnap_trajectories as ms
 from scipy.spatial.transform import Rotation as Rot
+import minsnap_trajectories as ms
 
 from lsy_drone_racing.control import Controller
 
@@ -25,139 +25,141 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
+PARAMS_RPY = np.array([[-12.7, 10.15], [-12.7, 10.15], [-8.117, 14.36]])
+PARAMS_ACC = np.array([0.1906, 0.4903])
+MASS = 0.033
+GRAVITY = 9.81
+THRUST_MIN = 0.05
+THRUST_MAX = 0.1425
+OBSTACLE_SIZE = 0.05
+GATE_SIZE = [0.245, 0.045, 0.0125, 0.29]
+
+
 def export_quadrotor_ode_model() -> AcadosModel:
     """Symbolic Quadrotor Model."""
     # Define name of solver to be used in script
-    model_name = "lsy_example_mpc"
-
-    # Define Gravitational Acceleration
-    GRAVITY = 9.806
-
-    # Sys ID Params
-    params_pitch_rate = [-6.003842038081178, 6.213752925707588]
-    params_roll_rate = [-3.960889336015948, 4.078293254657104]
-    params_yaw_rate = [-0.005347588299390372, 0.0]
-    params_acc = [20.907574256269616, 3.653687545690674]
-
-    margin = 0.05  # 5 cm safety margin
+    model_name = "drone_mpc"
 
     """Model setting"""
     # define basic variables in state and input vector
-    px = MX.sym("px")  # 0
-    py = MX.sym("py")  # 1
-    pz = MX.sym("pz")  # 2
-    vx = MX.sym("vx")  # 3
-    vy = MX.sym("vy")  # 4
-    vz = MX.sym("vz")  # 5
-    roll = MX.sym("r")  # 6
-    pitch = MX.sym("p")  # 7
-    yaw = MX.sym("y")  # 8
-    f_collective = MX.sym("f_collective")
+    pos = vertcat(MX.sym("x"), MX.sym("y"), MX.sym("z"))
+    vel = vertcat(MX.sym("vx"), MX.sym("vy"), MX.sym("vz"))
+    rpy = vertcat(MX.sym("r"), MX.sym("p"), MX.sym("y"))
 
-    f_collective_cmd = MX.sym("f_collective_cmd")
-    r_cmd = MX.sym("r_cmd")
-    p_cmd = MX.sym("p_cmd")
-    y_cmd = MX.sym("y_cmd")
+    r_cmd, p_cmd, y_cmd = MX.sym("r_cmd"), MX.sym("p_cmd"), MX.sym("y_cmd")
+    thrust_cmd = MX.sym("thrust_cmd")
 
-    df_cmd = MX.sym("df_cmd")
-    dr_cmd = MX.sym("dr_cmd")
-    dp_cmd = MX.sym("dp_cmd")
-    dy_cmd = MX.sym("dy_cmd")
+    obstacle_pos= MX.sym("obstacles_params", 3) #[x, y, z]
+    gate_param = MX.sym("gates_params", 7) #[x, y, z, qx, qy, qz, qw] 
+    d_obs_safe = 0.1 + OBSTACLE_SIZE
+    d_gate_safe = 0.1
+    obs_cost = fmax(d_obs_safe - sqrt((pos[0] - obstacle_pos[0])**2 + (pos[1] - obstacle_pos[1])**2), 0)
+    gate_cost = []
 
+    rotation = quat_to_rot(gate_param[3:])
+    for i in range(4) :
+        edges = compute_gate_edges(gate_param[:3], rotation, i)
 
-    # Define symbolic parameters
-    obs_params = MX.sym("obs_params", 24) #[xmin, ymin, zmin, xmax, ymax, zmax]
-    gate_params = MX.sym("gate_params", 96) #[xmin, ymin, zmin, xmax, ymax, zmax]
+        xmin = edges[0]
+        ymin = edges[1]
+        zmin = edges[2]
+        xmax = edges[3]
+        ymax = edges[4]
+        zmax = edges[5]
     
+        dx = fmax(xmin - pos[0], fmax(pos[0] - xmax, 0))
+        dy = fmax(ymin - pos[1], fmax(pos[1] - ymax, 0))
+        dz = fmax(zmin - pos[2], fmax(pos[2] - zmax, 0))
+
+        dist_gate = fmax(d_gate_safe - sqrt(dx**2 + dy**2 + dz**2), 0)
+        gate_cost.append(dist_gate)       
+
     # define state and input vector
-    states = vertcat(
-        px,
-        py,
-        pz,
-        vx,
-        vy,
-        vz,
-        roll,
-        pitch,
-        yaw,
-        f_collective,
-        f_collective_cmd,
-        r_cmd,
-        p_cmd,
-        y_cmd,
-    )
-    inputs = vertcat(df_cmd, dr_cmd, dp_cmd, dy_cmd)
+    states = vertcat(pos, vel, rpy)
+    inputs = vertcat(thrust_cmd, r_cmd, p_cmd, y_cmd)
 
     # Define nonlinear system dynamics
-    f = vertcat(
-        vx,
-        vy,
-        vz,
-        (params_acc[0] * f_collective + params_acc[1])
-        * (cos(roll) * sin(pitch) * cos(yaw) + sin(roll) * sin(yaw)),
-        (params_acc[0] * f_collective + params_acc[1])
-        * (cos(roll) * sin(pitch) * sin(yaw) - sin(roll) * cos(yaw)),
-        (params_acc[0] * f_collective + params_acc[1]) * cos(roll) * cos(pitch) - GRAVITY,
-        params_roll_rate[0] * roll + params_roll_rate[1] * r_cmd,
-        params_pitch_rate[0] * pitch + params_pitch_rate[1] * p_cmd,
-        params_yaw_rate[0] * yaw + params_yaw_rate[1] * y_cmd,
-        10.0 * (f_collective_cmd - f_collective),
-        df_cmd,
-        dr_cmd,
-        dp_cmd,
-        dy_cmd,
+    pos_dot = vel
+    z_axis = vertcat(
+        cos(rpy[0]) * sin(rpy[1]) * cos(rpy[2]) + sin(rpy[0]) * sin(rpy[2]),
+        cos(rpy[0]) * sin(rpy[1]) * sin(rpy[2]) - sin(rpy[0]) * cos(rpy[2]),
+        cos(rpy[0]) * cos(rpy[1]),
     )
-
-    p = vertcat(obs_params, gate_params)
-
-    penalty = MX(0)
-
-    for i in range(4) :
-        xmin = obs_params[6*i + 0] - margin
-        ymin = obs_params[6*i + 1] - margin
-        zmin = obs_params[6*i + 2]
-        xmax = obs_params[6*i + 3] + margin
-        ymax = obs_params[6*i + 4] + margin
-        zmax = obs_params[6*i + 5]
-
-        rx = fmax(0, fmin(px - xmin, xmax - px))
-        ry = fmax(0, fmin(py - ymin, ymax - py))
-        rz = fmax(0, fmin(pz - zmin, zmax - pz))
-
-        penalty += rx * ry * rz 
-
-    
-    for i in range(16) :
-        xmin = gate_params[6*i + 0] - margin
-        ymin = gate_params[6*i + 1] - margin
-        zmin = gate_params[6*i + 2] - margin
-        xmax = gate_params[6*i + 3] + margin
-        ymax = gate_params[6*i + 4] + margin
-        zmax = gate_params[6*i + 5] + margin
-
-        rx = fmax(0, fmin(px - xmin, xmax - px))
-        ry = fmax(0, fmin(py - ymin, ymax - py))
-        rz = fmax(0, fmin(pz - zmin, zmax - pz))
-
-        penalty += rx * ry * rz 
-
-    # === Final penalty cost ===
-    penalty_weight = 100  # Tune based on solver behavior
-    penalty_cost = penalty_weight * penalty
+    thrust = PARAMS_ACC[0] + PARAMS_ACC[1] * inputs[0]
+    vel_dot = thrust * z_axis / MASS - vertcat([0.0, 0.0, GRAVITY])
+    rpy_dot = PARAMS_RPY[:, 0] * rpy + PARAMS_RPY[:, 1] * inputs[1:]
+    f = vertcat(pos_dot, vel_dot, rpy_dot)
 
     # Initialize the nonlinear model for NMPC formulation
     model = AcadosModel()
     model.name = model_name
     model.f_expl_expr = f
     model.f_impl_expr = None
-    model.cost_y_expr = vertcat(px, py, pz, vx, vy, vz, roll, pitch, yaw, f_collective, f_collective_cmd, r_cmd, p_cmd, y_cmd, penalty_cost)
-    model.cost_y_expr_e = model.cost_y_expr
+    model.cost_y_expr = vertcat(states, inputs, obs_cost, *gate_cost)
+    model.cost_y_expr_e = states
     model.x = states
     model.u = inputs
-    model.p = p
-
+    model.p = vertcat(obstacle_pos, gate_param)
 
     return model
+
+def quat_to_rot(q) :
+    """Convert CasADi quaternion [x, y, z, w] to rotation matrix."""
+    x, y, z, w = q[0], q[1], q[2], q[3]
+    return vertcat(
+        horzcat(1 - 2*y**2 - 2*z**2,     2*x*y - 2*z*w,     2*x*z + 2*y*w),
+        horzcat(2*x*y + 2*z*w, 1 - 2*x**2 - 2*z**2,         2*y*z - 2*x*w),
+        horzcat(2*x*z - 2*y*w,     2*y*z + 2*x*w, 1 - 2*x**2 - 2*y**2)
+    )
+def compute_gate_edges(gate_pos, rotation, edge):
+        """
+        Compute bounding boxes for all edges of all gates.
+
+        Parameters:
+            gate_pos (np.ndarray): (N_gates, 3) array of gate center positions
+            gate_quat (np.ndarray): (N_gates, 4) array of quaternions [x, y, z, w]
+            gate_width (float): width of the gate center opening
+            gate_edge (tuple): (edge_width, edge_thickness, edge_height)
+
+        Returns:
+            np.ndarray: (N_gates * 4, 6) array of bounding boxes per edge:
+                        [xmin, ymin, zmin, xmax, ymax, zmax]
+        """
+        
+        i = 1 if edge % 2 == 0 else -1
+
+        if edge < 2:
+            # Left/right vertical edge
+            p0 = rotation @ vertcat(
+                -i * (GATE_SIZE[0] + 2 * GATE_SIZE[1]),
+                -GATE_SIZE[2],
+                -GATE_SIZE[3]
+                )
+
+            p1 = rotation @ vertcat(
+                -i * (GATE_SIZE[0]),
+                GATE_SIZE[2],
+                GATE_SIZE[3]
+                )
+        else:
+            # Top/bottom horizontal edge
+            p0 = rotation @ vertcat(
+                -GATE_SIZE[3],
+                -GATE_SIZE[2],
+                -i * (GATE_SIZE[0] + 2 * GATE_SIZE[1]),
+                )
+
+            p1 = rotation @ vertcat(
+                GATE_SIZE[3],
+                GATE_SIZE[2],
+                -i * (GATE_SIZE[0]),
+                )
+
+        min_edge = fmin(p0, p1) + gate_pos
+        max_edge = fmax(p0, p1) + gate_pos
+        #print(min_edge, max_edge)
+
+        return vertcat(min_edge, max_edge) 
 
 
 def create_ocp_solver(
@@ -169,75 +171,83 @@ def create_ocp_solver(
     # set model
     model = export_quadrotor_ode_model()
     ocp.model = model
-    x = ocp.model.x
+
     # Get Dimensions
     nx = model.x.rows()
-    nu = model.u.rows()
-    #ny = nx + nu
-    #ny_e = nx
+    nu = model.u.rows() 
+    ny = nx + nu + 5
+    ny_e = nx
 
     # Set dimensions
     ocp.solver_options.N_horizon = N
 
     ## Set Cost
-    # For more Information regarding Cost Function Definition in Acados: https://github.com/acados/acados/blob/main/docs/problem_formulation/problem_formulation_ocp_mex.pdf
+    # For more Information regarding Cost Function Definition in Acados:
+    # https://github.com/acados/acados/blob/main/docs/problem_formulation/problem_formulation_ocp_mex.pdf
+    #
 
     # Cost Type
     ocp.cost.cost_type = "NONLINEAR_LS"
     ocp.cost.cost_type_e = "NONLINEAR_LS"
 
+
     ocp.cost_y_expr = model.cost_y_expr
     ocp.cost_y_expr_e = model.cost_y_expr_e
 
-    # Weights
-    ocp.cost.W = np.diag([
-        0.5, 0.5, 0.5,      # position
-        0.01, 0.01, 0.01,   # velocity
-        0.1, 0.1, 0.1,      # orientation
-        0.01, 0.01,         # f_collective, f_collective_cmd
-        0.01, 0.01, 0.01,   # r_cmd, p_cmd, y_cmd
-        10.0               # penalty_cost weight (adjust as needed)
-    ])
 
-    ocp.cost.W_e = ocp.cost.W
-    
+    # Weights (we only give pos reference anyway)
+    Q = np.diag(
+        [
+            15.0,  # pos
+            15.0,  # pos
+            15.0,  # pos
+            0.0,  # vel
+            0.0,  # vel
+            0.0,  # vel
+            0.0,  # rpy
+            0.0,  # rpy
+            10.0  # rpy
+            
+        ]
+    )
+
+    R = np.diag(
+        [
+            20.0,  # thrust
+            7.0,  # rpy
+            7.0,  # rpy
+            1.0,  # rpy
+            10000.0,  #obstacle
+            1000.0,
+            1000.0,
+            1000.0,
+            1000.0,
+        ]
+    )
+
+    Q_e = Q.copy()
+    ocp.cost.W = scipy.linalg.block_diag(Q, R)
+    ocp.cost.W_e = Q_e
+
 
     # Set initial references (we will overwrite these later on to make the controller track the traj.)
-    ocp.cost.yef = ocp.cost.yref = np.array([
-        1.0, 1.5, 0.07,    # position reference
-        0.0, 0.0, 0.0,          # velocity
-        0.0, 0.0, 0.0,      # orientation
-        0.35, 0.35,               # f_collective, f_collective_cmd
-        0.0, 0.0, 0.0,          # r_cmd, p_cmd, y_cmd
-        0.0                     # penalty_cost
-    ])
-    
-    ocp.cost.yref_e = ocp.cost.yref
+    ocp.cost.yref, ocp.cost.yref_e = np.zeros((ny,)), np.zeros((ny_e,))
 
-    # Set State Constraints
-    ocp.constraints.lbx = np.array([0.1, 0.1, -1.57, -1.57, -1.57])
-    ocp.constraints.ubx = np.array([0.55, 0.55, 1.57, 1.57, 1.57])
-    ocp.constraints.idxbx = np.array([9, 10, 11, 12, 13])
+    # Set State Constraints (rpy < 60°)
+    ocp.constraints.lbx = np.array([0.03, -1.0, -1.0, -0.1])
+    ocp.constraints.ubx = np.array([2.0, 1.0, 1.0, 0.1])
+    ocp.constraints.idxbx = np.array([2, 6, 7, 8])
 
-    # Set Input Constraints
-    # ocp.constraints.lbu = np.array([-10.0, -10.0, -10.0. -10.0])
-    # ocp.constraints.ubu = np.array([10.0, 10.0, 10.0, 10.0])
-    # ocp.constraints.idxbu = np.array([0, 1, 2, 3])
-
-    # Set Path Constraints
-    # Distance squared from waypoint
-    #dist_squared = (x[0] - ocp.cost.yef[0])**2 + (x[1] - ocp.cost.yef[1])**2 + (x[2] - ocp.cost.yef[2])**2
-    #tube_radius = 0.5  # meters
-
-    #ocp.constraints.lh = np.array([0.0])                 # minimum distance: 0
-   # ocp.constraints.uh = np.array([tube_radius**2])      # max squared distance
-
-    #ocp.model.con_h_expr = dist_squared
+    # Set Input Constraints (rpy < 60°)
+    ocp.constraints.lbu = np.array([THRUST_MIN * 4 , -1.0, -1.0, -1.0])
+    ocp.constraints.ubu = np.array([THRUST_MAX * 4, 1.0, 1.0, 1.0])
+    ocp.constraints.idxbu = np.array([0, 1, 2, 3])
 
     # We have to set x0 even though we will overwrite it later on.
     ocp.constraints.x0 = np.zeros((nx))
     p = model.p.rows()
-    ocp.parameter_values = np.zeros(p)
+    ocp.parameter_values = np.zeros((p))
+
 
     # Solver Options
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"  # FULL_CONDENSING_QPOASES
@@ -255,12 +265,14 @@ def create_ocp_solver(
     # set prediction horizon
     ocp.solver_options.tf = Tf
 
-    acados_ocp_solver = AcadosOcpSolver(ocp, json_file="lsy_example_mpc.json", verbose=verbose)
+    acados_ocp_solver = AcadosOcpSolver(
+        ocp, json_file="c_generated_code/lsy_example_mpc.json", verbose=verbose
+    )
 
     return acados_ocp_solver, ocp
 
 
-class MPController(Controller):
+class AttitudeMPC(Controller):
     """Example of a MPC using the collective thrust and attitude interface."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
@@ -273,157 +285,65 @@ class MPController(Controller):
             config: The configuration of the environment.
         """
         super().__init__(obs, info, config)
-        self._freq = config.env.freq
-        self._tick = 0
+        self._N = 20
+        self._dt = 1 / config.env.freq
+        self._T_HORIZON = self._N * self._dt
+        self._t_total = 10.0
 
-        self.current_pos = obs["pos"]
-        self.gates_pos = obs["gates_pos"]
+        self.initial_pos = obs["pos"]
+        self.gates_pos = gates_pos = obs["gates_pos"]
         self.gates_quat = obs["gates_quat"]
-        self.obstacles = obs["obstacles_pos"]
         self.gates_visited = obs["gates_visited"]
-        self.obstacles_visited = obs["obstacles_visited"]
-        self.obstacle_boxes = []
-        self.gate_edge_boxes = []
-        self.obstacles_size = [0.05, 1.4] 
-        self.gates_edges_size = [0.045, 0.0125, 0.29]
-        self.gates_size = 0.245
+        self.gates_edges = np.zeros((4, 4, 6))
+
+        for i in range(len(self.gates_pos)) :
+            for j in range(4) : 
+                self.gates_edges[i][j] = self._compute_gate_edges(self.gates_pos[i], self.gates_quat[i], j)
 
         # Same waypoints as in the trajectory controller. Determined by trial and error.
-        waypoints = np.array(
-            [
-                [1.0, 1.5, 0.05],
-                [0.8, 1.0, 0.2],
-                [0.55, -0.3, 0.5],
-                [0.2, -1.3, 0.65],
-                [1.1, -0.85, 1.1],
-                [0.2, 0.5, 0.65],
-                [0.0, 1.2, 0.525],
-                [0.0, 1.2, 1.1],
-                [-0.5, 0.0, 1.1],
-                [-0.5, -0.5, 1.1],
-            ]
+        
+        waypoints = [self.initial_pos] + list(gates_pos) + [[-0.5, -0.5, 1.1]]
+        segment_times = np.linspace(0, self._t_total, len(waypoints))
+        
+        refs = [
+            ms.Waypoint(position=pos, time=t)
+            for pos, t in zip(waypoints, segment_times)
+        ]
+
+        polys = ms.generate_trajectory(
+            refs,
+            degree=13,
+            idx_minimized_orders=(3, 4),
+            num_continuous_orders=3,
+            algorithm="closed-form",
         )
+            
+        sample_times = np.linspace(0, self._t_total, int(self._t_total / self._dt))
 
-        # Scale trajectory between 0 and 1
-        ts = np.linspace(0, 1, np.shape(waypoints)[0])
-        cs_x = CubicSpline(ts, waypoints[:, 0])
-        cs_y = CubicSpline(ts, waypoints[:, 1])
-        cs_z = CubicSpline(ts, waypoints[:, 2])
-
-        des_completion_time = 8
-        ts = np.linspace(0, 1, int(self._freq * des_completion_time))
-
-        self.x_des = cs_x(ts)
-        self.y_des = cs_y(ts)
-        self.z_des = cs_z(ts)
-
-        self.N = 30
-        self.T_HORIZON = 1.5
-        self.dt = self.T_HORIZON / self.N
-        self.x_des = np.concatenate((self.x_des, [self.x_des[-1]] * (2 * self.N + 1)))
-        self.y_des = np.concatenate((self.y_des, [self.y_des[-1]] * (2 * self.N + 1)))
-        self.z_des = np.concatenate((self.z_des, [self.z_des[-1]] * (2 * self.N + 1)))
-
-        self.acados_ocp_solver, self.ocp = create_ocp_solver(self.T_HORIZON, self.N)
-
-        for i in range(4):
-            self.obstacle_boxes.append(self.compute_obstacle_boxes(i))
-            self.gate_edge_boxes.extend(self.compute_gate_edge_boxes(i))
-        params = np.hstack([np.array(self.obstacle_boxes).flatten(), np.array(self.gate_edge_boxes).flatten()])
-        self.acados_ocp_solver.set(0, "p", params)
-        #print(f"p: {self.acados_ocp_solver.get(0,"p")}")
-
-
-        self.last_f_collective = 0.3
-        self.last_rpy_cmd = np.zeros(3)
-        self.last_f_cmd = 0.3
-        self.config = config
-        self.finished = False
-
-    def compute_obstacle_boxes(self, index):
-        """
-        Compute bounding boxes [xmin, ymin, zmin, xmax, ymax, zmax] for each obstacle.
-
-        Parameters:
-            obstacle_pos (list of [x, y, z]): list of obstacle positions
-            obstacle_size (tuple) : (obstacle_width, obstacle_height)
-
-        Returns:
-            np.ndarray: Flattened list of bounding box coordinates for all obstacles
-        """
-        obstacle_width, obstacle_height = self.obstacles_size
+        pva = ms.compute_trajectory_derivatives(polys, sample_times, order=3)
+        # Then you fill your reference arrays:
+        x_des = pva[0, :, 0]  # position x
+        y_des = pva[0, :, 1]  # position y
+        z_des = pva[0, :, 2]  # position z
         
-        x, y, z = self.obstacles[index]
-        xmin = x - obstacle_width
-        xmax = x + obstacle_width
-        ymin = y - obstacle_width
-        ymax = y + obstacle_width
-        zmin = z - obstacle_height
-        zmax = z
+        x_des = np.concatenate((x_des, [x_des[-1]] * (self._N + 1)))
+        y_des = np.concatenate((y_des, [y_des[-1]] * (self._N + 1)))
+        z_des = np.concatenate((z_des, [z_des[-1]] * (self._N + 1)))
+        self._waypoints_pos = np.stack((x_des, y_des, z_des)).T
+        self._waypoints_yaw = x_des * 0
 
-        return np.array([xmin, ymin, zmin, xmax, ymax, zmax])
+        self._acados_ocp_solver, self._ocp = create_ocp_solver(self._T_HORIZON, self._N)
+        self._nx = self._ocp.model.x.rows()
+        self._nu = self._ocp.model.u.rows()
+        self._ny = self._nx + self._nu + 5
+        self._ny_e = self._nx
+
+        self._tick = 0
+        self._tick_max = len(x_des) - 1 - self._N
+        self._config = config
+        self._finished = False
         
-    def compute_gate_edge_boxes(self, index):
-        """
-        Compute bounding boxes for all edges of all gates.
 
-        Parameters:
-            gate_pos (np.ndarray): (N_gates, 3) array of gate center positions
-            gate_quat (np.ndarray): (N_gates, 4) array of quaternions [x, y, z, w]
-            gate_width (float): width of the gate center opening
-            gate_edge (tuple): (edge_width, edge_thickness, edge_height)
-
-        Returns:
-            np.ndarray: (N_gates * 4, 6) array of bounding boxes per edge:
-                        [xmin, ymin, zmin, xmax, ymax, zmax]
-        """
-        edge_width, edge_thickness, edge_height = self.gates_edges_size
-        gate_width = self.gates_size
-        pos = self.gates_pos[index]
-        quat = self.gates_quat[index]
-        rotation = Rot.from_quat(quat)
-        print(quat)
-        print(rotation)
-        
-        all_boxes = []
-
-        for edge in range(4):
-            i = 1 if edge % 2 == 0 else -1
-
-            if edge < 2:
-                # Left/right vertical edge
-                p0 = rotation.apply([
-                    -edge_thickness,
-                    -i * (gate_width + 2*edge_width),
-                    -edge_height
-                ]) + pos
-
-                p1 = rotation.apply([
-                    edge_thickness,
-                    -i * (gate_width),
-                    edge_height
-                ]) + pos
-            else:
-                # Top/bottom horizontal edge
-                p0 = rotation.apply([
-                    -edge_thickness,
-                    -edge_height,
-                    -i * (gate_width + 2*edge_width),
-                ]) + pos
-
-                p1 = rotation.apply([
-                    edge_thickness,
-                    edge_height,
-                    -i * (gate_width),
-                ]) + pos
-
-            min_edge = np.minimum(p0, p1)
-            max_edge = np.maximum(p0, p1)
-            print(min_edge, max_edge)
-            all_boxes.append(np.array([*min_edge, *max_edge]))
-
-        return all_boxes
-    
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
@@ -437,100 +357,91 @@ class MPController(Controller):
         Returns:
             The collective thrust and orientation [t_des, r_des, p_des, y_des] as a numpy array.
         """
-        i = min(self._tick, len(self.x_des) - 1)
-        if self._tick > i:
-            self.finished = True
+        i = min(self._tick, self._tick_max)
+        if self._tick >= self._tick_max:
+            self._finished = True
 
-        q = obs["quat"]
-        r = Rot.from_quat(q)
-        
-        self.current_pos = obs["pos"]
+        # Setting initial state
+        obs["rpy"] = Rot.from_quat(obs["quat"]).as_euler("xyz")
+        x0 = np.concatenate((obs["pos"], obs["vel"], obs["rpy"]))
+        self._acados_ocp_solver.set(0, "lbx", x0)
+        self._acados_ocp_solver.set(0, "ubx", x0)
+        i_target = obs["target_gate"]
         self.gates_pos = obs["gates_pos"]
         self.gates_quat = obs["gates_quat"]
-        
-        self.obstacles = obs["obstacles_pos"]
-        self.obstacles_visited = obs["obstacles_visited"]
+        self.obstacles_pos = obs["obstacles_pos"]
 
-        # Convert to Euler angles in XYZ order
-        rpy = r.as_euler("xyz", degrees=False)  # Set degrees=False for radians
-
-        xcurrent = np.concatenate(
-            (
-                obs["pos"],
-                obs["vel"],
-                rpy,
-                np.array([self.last_f_collective, self.last_f_cmd]),
-                self.last_rpy_cmd,
-            )
-        )
-        self.acados_ocp_solver.set(0, "lbx", xcurrent)
-        self.acados_ocp_solver.set(0, "ubx", xcurrent)
-
-    
-        """for k in range(self.N):
-            # Reference state: position + velocity
-            pos_des = pva[k, 0]  # shape (3,)
-            vel_des = pva[k, 1]  # shape (3,)
+        if  self.gates_visited[i_target] != obs["gates_visited"][i_target] :
+            waypoints = [self.initial_pos] + list(self.gates_pos) + [[-0.5, -0.5, 1.1]]
+            segment_times = np.linspace(0, self._t_total, len(waypoints))
             
-            # Build full reference depending on your model (example with 13D state: pos, vel, angles, ang_vel)
-            yref = np.zeros(13 + 4)  # state + control dims
-            yref[0:3] = pos_des
-            yref[3:6] = vel_des
-            yref[9:10] = [0.35, 0,35]
-            # Rest of yref[6:] can stay zero unless you want to track attitudes, inputs, etc.
+            refs = [
+                ms.Waypoint(position=pos, time=t)
+                for pos, t in zip(waypoints, segment_times)
+            ]
 
-            self.acados_ocp_solver.set(k, "yref", yref)"""
+            polys = ms.generate_trajectory(
+                refs,
+                degree=13,
+                idx_minimized_orders=(3, 4),
+                num_continuous_orders=3,
+                algorithm="closed-form",
+            )
+                
+            sample_times = np.linspace(0, self._t_total, int(self._t_total / self._dt))
 
-        for j in range(self.N):
-            yref = np.array([
-                self.x_des[i + j],           # px
-                self.y_des[i + j],           # py
-                self.z_des[i + j],           # pz      # pz
-                0.0, 0.0, 0.0,           # vx, vy, vz (desired velocity)
-                0.0, 0.0, 0.0,               # roll, pitch, yaw
-                0.35, 0.35,                    # f_collective, f_collective_cmd
-                0.0, 0.0, 0.0,               # r_cmd, p_cmd, y_cmd
-                0.0                          # penalty_cost (or expected/nominal value)
-            ])
-            self.acados_ocp_solver.set(j, "yref", yref)
-        
-        yref_N = np.array([
-            self.x_des[i + self.N],
-            self.y_des[i + self.N],
-            self.z_des[i + self.N],           # pz
-            0.0, 0.0, 0.0,  
-            0.0, 0.0, 0.0,
-            0.35, 0.35,
-            0.0, 0.0, 0.0,
-            0.0
-        ])
-        self.acados_ocp_solver.set(self.N, "yref", yref_N)
+            pva = ms.compute_trajectory_derivatives(polys, sample_times, order=3)
+            # Then you fill your reference arrays:
+            x_des = pva[0, :, 0]  # position x
+            y_des = pva[0, :, 1]  # position y
+            z_des = pva[0, :, 2]  # position z
+            
+            x_des = np.concatenate((x_des, [x_des[-1]] * (self._N + 1)))
+            y_des = np.concatenate((y_des, [y_des[-1]] * (self._N + 1)))
+            z_des = np.concatenate((z_des, [z_des[-1]] * (self._N + 1)))
+            self._waypoints_pos = np.stack((x_des, y_des, z_des)).T
+            self._waypoints_yaw = x_des * 0
+            self.gates_visited = obs["gates_visited"]
 
         
-        for i in range(len(self.obstacles)) : 
-            if obs["obstacles_visited"][i] and not self.obstacles_visited[i] :
-                self.obstacle_boxes[i] = self.compute_obstacle_boxes(i)
-        self.obstacles_visited = obs["obstacles_visited"]   
+        # Setting reference
         
-        for i in range(len(self.gates_pos)) : 
-            if obs["gates_visited"][i] and not self.gates_visited[i] : 
-                self.gate_edge_boxes[4*i : 4*i + 4]  = self.compute_gate_edge_boxes(i)
-        self.gates_visited = obs["gates_visited"]  
-        params = np.hstack([np.array(self.obstacle_boxes).flatten(), np.array(self.gate_edge_boxes).flatten()])
-        self.acados_ocp_solver.set(0, "p", params)
+        for j in range(self._N):
+            idx_closest_gate =  np.argmin(np.linalg.norm(self._waypoints_pos[i+j] - self.gates_pos, axis=1))
+            idx_closest_obs  =  np.argmin(np.linalg.norm(self._waypoints_pos[i+j, :2] - self.obstacles_pos[:, :2], axis=1))
+            params = np.concatenate([
+                                    self.obstacles_pos[idx_closest_obs], 
+                                    self.gates_pos[idx_closest_gate], 
+                                    self.gates_quat[idx_closest_gate]
+                                ])
+            self._acados_ocp_solver.set(j, "p", params)
+            yref = np.zeros(( self._ny))
+            yref[0:3] = self._waypoints_pos[i + j]  # position
+            yref[8] = self._waypoints_yaw[i + j]  # yaw
+            yref[9] = MASS * GRAVITY  # hover thrust
+            self._acados_ocp_solver.set(j, "yref", yref)
 
+        yref_e = np.zeros((self._ny_e))
+        yref_e[0:3] = self._waypoints_pos[i + self._N]  # position
+        yref_e[8] = self._waypoints_yaw[i + self._N]  # yaw
+        self._acados_ocp_solver.set(self._N, "yref", yref_e)
 
-        self.acados_ocp_solver.solve()
-        #print(f"p: {self.acados_ocp_solver.get(0,"p")}")
-        x1 = self.acados_ocp_solver.get(1, "x")
-        w = 1 / self._freq / self.dt
-        self.last_f_collective = self.last_f_collective * (1 - w) + x1[9] * w
-        self.last_f_cmd = x1[10]
-        self.last_rpy_cmd = x1[11:14]
+        # Solving problem and getting first input
+        self._acados_ocp_solver.solve()
+        u1 = self._acados_ocp_solver.get(1, "u")
+        
+        
+        cost_value = self._acados_ocp_solver.get_cost()
+        print(f"Cost after solve: {cost_value}") 
+        print(f"thrust = {self._acados_ocp_solver.get(1, "u")}")
 
-        cmd = x1[10:14]
+        # WARNING: The following line is only for legacy reason!
+        # The Crazyflie uses the rpyt command format, the environment
+        # take trpy format. Remove this line as soon as the env
+        # also works with rpyt!
+        #u0 = np.array([u0[3], *u0[:3]], dtype=np.float32)
 
-        return cmd
+        return u1
 
     def step_callback(
         self,
@@ -544,7 +455,7 @@ class MPController(Controller):
         """Increment the tick counter."""
         self._tick += 1
 
-        return self.finished
+        return self._finished
 
     def episode_callback(self):
         """Reset the integral error."""
