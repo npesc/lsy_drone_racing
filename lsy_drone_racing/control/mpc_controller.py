@@ -51,8 +51,9 @@ def export_quadrotor_ode_model() -> AcadosModel:
 
     obstacle_pos= MX.sym("obstacles_params", 3) #[x, y, z]
     gate_param = MX.sym("gates_params", 7) #[x, y, z, qx, qy, qz, qw] 
+    
     d_obs_safe = 0.1 + OBSTACLE_SIZE
-    d_gate_safe = 0.1
+    d_gate_safe = 0.2
     obs_cost = fmax(d_obs_safe - sqrt((pos[0] - obstacle_pos[0])**2 + (pos[1] - obstacle_pos[1])**2), 0)
     gate_cost = []
 
@@ -198,9 +199,9 @@ def create_ocp_solver(
     # Weights (we only give pos reference anyway)
     Q = np.diag(
         [
-            15.0,  # pos
-            15.0,  # pos
-            15.0,  # pos
+            10.0,  # pos
+            10.0,  # pos
+            20.0,  # pos
             0.0,  # vel
             0.0,  # vel
             0.0,  # vel
@@ -213,10 +214,10 @@ def create_ocp_solver(
 
     R = np.diag(
         [
-            20.0,  # thrust
-            7.0,  # rpy
-            7.0,  # rpy
-            1.0,  # rpy
+            25.0,  # thrust
+            10.0,  # rpy
+            10.0,  # rpy
+            15.0,  # rpy
             10000.0,  #obstacle
             1000.0,
             1000.0,
@@ -272,7 +273,7 @@ def create_ocp_solver(
     return acados_ocp_solver, ocp
 
 
-class AttitudeMPC(Controller):
+class MPC_Controller(Controller):
     """Example of a MPC using the collective thrust and attitude interface."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
@@ -291,18 +292,15 @@ class AttitudeMPC(Controller):
         self._t_total = 10.0
 
         self.initial_pos = obs["pos"]
-        self.gates_pos = gates_pos = obs["gates_pos"]
+        self.gates_pos = obs["gates_pos"]
         self.gates_quat = obs["gates_quat"]
         self.gates_visited = obs["gates_visited"]
         self.gates_edges = np.zeros((4, 4, 6))
-
-        for i in range(len(self.gates_pos)) :
-            for j in range(4) : 
-                self.gates_edges[i][j] = self._compute_gate_edges(self.gates_pos[i], self.gates_quat[i], j)
+        self.obstacles_visited = obs["obstacles_visited"]
 
         # Same waypoints as in the trajectory controller. Determined by trial and error.
         
-        waypoints = [self.initial_pos] + list(gates_pos) + [[-0.5, -0.5, 1.1]]
+        waypoints = [self.initial_pos] + list(self.gates_pos) + [[-0.5, -0.5, 1.1]]
         segment_times = np.linspace(0, self._t_total, len(waypoints))
         
         refs = [
@@ -322,15 +320,20 @@ class AttitudeMPC(Controller):
 
         pva = ms.compute_trajectory_derivatives(polys, sample_times, order=3)
         # Then you fill your reference arrays:
-        x_des = pva[0, :, 0]  # position x
-        y_des = pva[0, :, 1]  # position y
-        z_des = pva[0, :, 2]  # position z
-        
-        x_des = np.concatenate((x_des, [x_des[-1]] * (self._N + 1)))
-        y_des = np.concatenate((y_des, [y_des[-1]] * (self._N + 1)))
-        z_des = np.concatenate((z_des, [z_des[-1]] * (self._N + 1)))
-        self._waypoints_pos = np.stack((x_des, y_des, z_des)).T
-        self._waypoints_yaw = x_des * 0
+        x_des = pva[0, :, 0]  # position + velocity x
+        y_des = pva[0, :, 1]  # position + velocity y
+        z_des = pva[0, :, 2]  # position + velocity z
+
+        x_pos = np.concatenate((x_des, [x_des[-1]] * (self._N + 1)))
+        y_pos = np.concatenate((y_des, [y_des[-1]] * (self._N + 1)))
+        z_pos = np.concatenate((z_des, [z_des[-1]] * (self._N + 1)))
+        print(x_pos.shape)
+        #x_vel = np.concatenate((x_des[1], [x_des[1, -1]] * (self._N + 1)))
+        #y_vel = np.concatenate((y_des[1], [y_des[1, -1]] * (self._N + 1)))
+        #z_vel = np.concatenate((z_des[1], [z_des[1, -1]] * (self._N + 1)))
+        self._waypoints_pos = np.stack((x_pos, y_pos, z_pos)).T
+        #self._waypoints_vel = np.stack((x_vel, y_vel, z_vel)).T
+        self._waypoints_yaw = x_pos * 0
 
         self._acados_ocp_solver, self._ocp = create_ocp_solver(self._T_HORIZON, self._N)
         self._nx = self._ocp.model.x.rows()
@@ -371,9 +374,15 @@ class AttitudeMPC(Controller):
         self.gates_quat = obs["gates_quat"]
         self.obstacles_pos = obs["obstacles_pos"]
 
-        if  self.gates_visited[i_target] != obs["gates_visited"][i_target] :
-            waypoints = [self.initial_pos] + list(self.gates_pos) + [[-0.5, -0.5, 1.1]]
-            segment_times = np.linspace(0, self._t_total, len(waypoints))
+        if  self.gates_visited[i_target] != obs["gates_visited"][i_target]:
+            waypoints = [
+                            x0[:3],
+                            self.gates_pos[i_target],
+                            self._waypoints_pos[i + self._N]
+                        ]
+            t_start = i * self._dt
+            t_end   = t_start + self._N * self._dt
+            segment_times = np.linspace(t_start, t_end, len(waypoints))
             
             refs = [
                 ms.Waypoint(position=pos, time=t)
@@ -388,21 +397,27 @@ class AttitudeMPC(Controller):
                 algorithm="closed-form",
             )
                 
-            sample_times = np.linspace(0, self._t_total, int(self._t_total / self._dt))
-
+            sample_times = np.linspace(t_start, t_end, int((t_end - t_start) / self._dt))
             pva = ms.compute_trajectory_derivatives(polys, sample_times, order=3)
+
             # Then you fill your reference arrays:
             x_des = pva[0, :, 0]  # position x
             y_des = pva[0, :, 1]  # position y
             z_des = pva[0, :, 2]  # position z
+            x_pos = self._waypoints_pos[:, 0]
+            y_pos = self._waypoints_pos[:, 1]
+            z_pos = self._waypoints_pos[:, 2]
             
-            x_des = np.concatenate((x_des, [x_des[-1]] * (self._N + 1)))
-            y_des = np.concatenate((y_des, [y_des[-1]] * (self._N + 1)))
-            z_des = np.concatenate((z_des, [z_des[-1]] * (self._N + 1)))
-            self._waypoints_pos = np.stack((x_des, y_des, z_des)).T
-            self._waypoints_yaw = x_des * 0
-            self.gates_visited = obs["gates_visited"]
+            x_pos = np.concatenate((x_pos[:i], x_des, x_pos[i + self._N + 1:]))
+            y_pos = np.concatenate((y_pos[:i], y_des, y_pos[i + self._N + 1:]))
+            z_pos = np.concatenate((z_pos[:i], z_des, z_pos[i + self._N + 1:]))
+            #print(x_pos.shape)
 
+            self._waypoints_pos = np.stack((x_pos, y_pos, z_pos)).T
+            #self._waypoints_vel = np.stack((x_vel, y_vel, z_vel)).T
+            self._waypoints_yaw = x_pos * 0
+            self.gates_visited = obs["gates_visited"]
+            self.obstacles_visited = obs["obstacles_visited"]
         
         # Setting reference
         
@@ -417,12 +432,14 @@ class AttitudeMPC(Controller):
             self._acados_ocp_solver.set(j, "p", params)
             yref = np.zeros(( self._ny))
             yref[0:3] = self._waypoints_pos[i + j]  # position
+            #yref[3:6] = self._waypoints_vel[i + j]  # velocity
             yref[8] = self._waypoints_yaw[i + j]  # yaw
             yref[9] = MASS * GRAVITY  # hover thrust
             self._acados_ocp_solver.set(j, "yref", yref)
 
         yref_e = np.zeros((self._ny_e))
         yref_e[0:3] = self._waypoints_pos[i + self._N]  # position
+        #yref[3:6] = self._waypoints_vel[i + self._N]  # velocity
         yref_e[8] = self._waypoints_yaw[i + self._N]  # yaw
         self._acados_ocp_solver.set(self._N, "yref", yref_e)
 
@@ -432,8 +449,8 @@ class AttitudeMPC(Controller):
         
         
         cost_value = self._acados_ocp_solver.get_cost()
-        print(f"Cost after solve: {cost_value}") 
-        print(f"thrust = {self._acados_ocp_solver.get(1, "u")}")
+        #print(f"Cost after solve: {cost_value}") 
+        #print(f"thrust = {self._acados_ocp_solver.get(1, "u")}")
 
         # WARNING: The following line is only for legacy reason!
         # The Crazyflie uses the rpyt command format, the environment

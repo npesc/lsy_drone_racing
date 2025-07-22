@@ -5,7 +5,7 @@
 # | `level1.toml`       | **Yes**                   | **No**                     | Adaptive |
 [controller]
 # Put your controller file name here. Specifying a controller as argument to scripts will override this setting. Controllers are located in `lsy_drone_racing/control/`
-file = "copy_mpc_controller.py"
+file = "mpc_controller.py"
 
 [deploy]
 ### Settings only relevant for deployment
