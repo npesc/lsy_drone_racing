@@ -418,33 +418,41 @@ class RaceCoreEnv:
         return obs
 
     def reward(self) -> Array:
-        """Compute the reward for the current state.
-
-        Note:
-            The current sparse reward function will most likely not work directly for training an
-            agent. If you want to use reinforcement learning, you will need to define your own
-            reward function.
-
-        Returns:
-            Reward for the current state.
-        """
-        return -1.0 * (self.data.target_gate == -1)  # Implicit float conversion
+        """Custom reward: +10 for passing the first gate, -10 for crashing before first gate, -0.01 per step otherwise."""
+        # Only consider the first drone in each env (single-agent)
+        target_gate = self.data.target_gate[:, 0] if self.data.target_gate.ndim == 2 else self.data.target_gate
+        disabled = self.data.disabled_drones[:, 0] if self.data.disabled_drones.ndim == 2 else self.data.disabled_drones
+        # Track if the first gate has been passed
+        passed_first_gate = (target_gate == 1)
+        crashed_before_first_gate = (disabled & (target_gate == 0))
+        # Reward logic
+        reward = jp.where(passed_first_gate, 10.0, 0.0)
+        reward = jp.where(crashed_before_first_gate, -10.0, reward)
+        # Small step penalty otherwise
+        reward = jp.where((~passed_first_gate) & (~crashed_before_first_gate), -0.01, reward)
+        # Ensure reward is always 2D
+        reward = reward.reshape((self.sim.n_worlds, self.sim.n_drones))
+        return reward
 
     def terminated(self) -> Array:
-        """Check if the episode is terminated.
-
-        Returns:
-            True if all drones have been disabled, else False.
-        """
-        return self.data.disabled_drones
+        """Check if the episode is terminated: drone is disabled OR first gate is passed."""
+        target_gate = self.data.target_gate[:, 0] if self.data.target_gate.ndim == 2 else self.data.target_gate
+        disabled = self.data.disabled_drones[:, 0] if self.data.disabled_drones.ndim == 2 else self.data.disabled_drones
+        passed_first_gate = (target_gate == 1)
+        return disabled | passed_first_gate
 
     def truncated(self) -> Array:
         """Array of booleans indicating if the episode is truncated."""
         return self._truncated(self.data.steps, self.data.max_episode_steps, self.sim.n_drones)
 
     def info(self) -> dict:
-        """Return an info dictionary containing additional information about the environment."""
-        return {}
+        # Only consider the first drone in each env (single-agent)
+        target_gate = self.data.target_gate[:, 0] if self.data.target_gate.ndim == 2 else self.data.target_gate
+        n_gates = self.gates["pos"].shape[0] if hasattr(self.gates["pos"], 'shape') else len(self.gates["pos"])
+        return {
+            "target_gate": int(target_gate[0]),  # For single-agent
+            "n_gates": int(n_gates),
+        }
 
     @property
     def drone_mass(self) -> NDArray[np.floating]:

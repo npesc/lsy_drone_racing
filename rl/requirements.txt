@@ -1,0 +1,12 @@
+gymnasium>=0.28
+stable-baselines3[extra]>=2.1.0
+torch>=1.12
+numpy>=1.21
+tensorboard>=2.10
+ml-collections>=0.1.1
+scipy>=1.7
+packaging>=21.0
+# Add any project-specific dependencies below
+# jax and flax if used in your envs (optional, comment out if not needed)
+jax[cpu]>=0.4.13; platform_system != 'Windows'
+flax>=0.6.8 
