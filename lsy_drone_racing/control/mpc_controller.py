@@ -29,8 +29,8 @@ PARAMS_RPY = np.array([[-12.7, 10.15], [-12.7, 10.15], [-8.117, 14.36]])
 PARAMS_ACC = np.array([0.1906, 0.4903])
 MASS = 0.033
 GRAVITY = 9.81
-THRUST_MIN = 0.05
-THRUST_MAX = 0.1425
+THRUST_MIN = 0.03
+THRUST_MAX = 0.1225
 OBSTACLE_SIZE = 0.05
 GATE_SIZE = [0.245, 0.045, 0.0125, 0.29]
 
@@ -52,9 +52,16 @@ def export_quadrotor_ode_model() -> AcadosModel:
     obstacle_pos= MX.sym("obstacles_params", 3) #[x, y, z]
     gate_param = MX.sym("gates_params", 7) #[x, y, z, qx, qy, qz, qw] 
     
-    d_obs_safe = 0.1 + OBSTACLE_SIZE
-    d_gate_safe = 0.2
-    obs_cost = fmax(d_obs_safe - sqrt((pos[0] - obstacle_pos[0])**2 + (pos[1] - obstacle_pos[1])**2), 0)
+    d_obs_safe = 0.08
+    d_gate_safe = 0.15
+    xmin_obs = obstacle_pos[0] - OBSTACLE_SIZE
+    xmax_obs = obstacle_pos[0] + OBSTACLE_SIZE
+    ymin_obs = obstacle_pos[1] - OBSTACLE_SIZE
+    ymax_obs = obstacle_pos[1] + OBSTACLE_SIZE
+
+    obs_dist = sqrt((fmax(xmin_obs - pos[0], fmax(pos[0] - xmax_obs, 0)))**2 + (fmax(ymin_obs - pos[1], fmax(pos[1] - ymax_obs, 0)))**2)
+    obs_cost = fmax(0, (d_obs_safe - obs_dist))
+
     gate_cost = []
 
     rotation = quat_to_rot(gate_param[3:])
@@ -72,8 +79,8 @@ def export_quadrotor_ode_model() -> AcadosModel:
         dy = fmax(ymin - pos[1], fmax(pos[1] - ymax, 0))
         dz = fmax(zmin - pos[2], fmax(pos[2] - zmax, 0))
 
-        dist_gate = fmax(d_gate_safe - sqrt(dx**2 + dy**2 + dz**2), 0)
-        gate_cost.append(dist_gate)       
+        dist_gate = sqrt(dx**2 + dy**2 + dz**2)
+        gate_cost.append(fmax(0, (d_gate_safe - dist_gate)))       
 
     # define state and input vector
     states = vertcat(pos, vel, rpy)
@@ -199,15 +206,15 @@ def create_ocp_solver(
     # Weights (we only give pos reference anyway)
     Q = np.diag(
         [
-            10.0,  # pos
-            10.0,  # pos
-            20.0,  # pos
-            0.0,  # vel
-            0.0,  # vel
-            0.0,  # vel
-            0.0,  # rpy
-            0.0,  # rpy
-            10.0  # rpy
+            14.0,  # pos
+            14.0,  # pos
+            15.0,  # pos
+            5.0,  # vel
+            5.0,  # vel
+            5.0,  # vel
+            6.0,  # rpy
+            6.0,  # rpy
+            20.0  # rpy
             
         ]
     )
@@ -217,12 +224,12 @@ def create_ocp_solver(
             25.0,  # thrust
             10.0,  # rpy
             10.0,  # rpy
-            15.0,  # rpy
-            10000.0,  #obstacle
-            1000.0,
-            1000.0,
-            1000.0,
-            1000.0,
+            10.0,  # rpy
+            100000.0,   #obstacle
+            100000.0,    #edge 1
+            100000.0,    #edge 2
+            100000.0,    #edge 3
+            100000.0,    #edge 4
         ]
     )
 
@@ -289,7 +296,7 @@ class MPC_Controller(Controller):
         self._N = 20
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
-        self._t_total = 10.0
+        self._t_total = 12.0
 
         self.initial_pos = obs["pos"]
         self.gates_pos = obs["gates_pos"]
@@ -300,7 +307,7 @@ class MPC_Controller(Controller):
 
         # Same waypoints as in the trajectory controller. Determined by trial and error.
         
-        waypoints = [self.initial_pos] + list(self.gates_pos) + [[-0.5, -0.5, 1.1]]
+        waypoints = [self.initial_pos] + list(self.gates_pos[0:2]) + [self.gates_pos[2]] + [self.gates_pos[2] + 0.25 * Rot.from_quat(self.gates_quat[2]).apply([0, 1, 0])] + [self.gates_pos[3] + 0.25 * Rot.from_quat(self.gates_quat[3]).apply([0, 1, 0])]
         segment_times = np.linspace(0, self._t_total, len(waypoints))
         
         refs = [
@@ -310,29 +317,33 @@ class MPC_Controller(Controller):
 
         polys = ms.generate_trajectory(
             refs,
-            degree=13,
-            idx_minimized_orders=(3, 4),
+            degree=12,
+            idx_minimized_orders=(3,4),
             num_continuous_orders=3,
             algorithm="closed-form",
         )
             
         sample_times = np.linspace(0, self._t_total, int(self._t_total / self._dt))
 
-        pva = ms.compute_trajectory_derivatives(polys, sample_times, order=3)
+        states, inputs = ms.compute_quadrotor_trajectory(
+            polys,
+            sample_times,
+            vehicle_mass=MASS,
+            yaw=0.0,
+            #drag_params=ms.RotorDragParameters(0., 0.2, 1.0),
+        )
+        print(states.shape)
         # Then you fill your reference arrays:
-        x_des = pva[0, :, 0]  # position + velocity x
-        y_des = pva[0, :, 1]  # position + velocity y
-        z_des = pva[0, :, 2]  # position + velocity z
+        pos_des = np.array(states[:,0:3])  # position 
+        trust_des = np.array(inputs[:,0])  # shape (T, 4) → thrust, τx, τy, τz
 
-        x_pos = np.concatenate((x_des, [x_des[-1]] * (self._N + 1)))
-        y_pos = np.concatenate((y_des, [y_des[-1]] * (self._N + 1)))
-        z_pos = np.concatenate((z_des, [z_des[-1]] * (self._N + 1)))
-        print(x_pos.shape)
-        #x_vel = np.concatenate((x_des[1], [x_des[1, -1]] * (self._N + 1)))
-        #y_vel = np.concatenate((y_des[1], [y_des[1, -1]] * (self._N + 1)))
-        #z_vel = np.concatenate((z_des[1], [z_des[1, -1]] * (self._N + 1)))
+        x_pos = np.concatenate((pos_des[:,0], [pos_des[-1, 0]] * (self._N + 1)))
+        y_pos = np.concatenate((pos_des[:,1], [pos_des[-1, 1]] * (self._N + 1)))
+        z_pos = np.concatenate((pos_des[:,2], [pos_des[-1, 2]] * (self._N + 1)))
+
+        #f_des = m * (a_des - g)
+        self._waypoints_thrust = np.concatenate((trust_des, [trust_des[-1]] * (self._N + 1)))
         self._waypoints_pos = np.stack((x_pos, y_pos, z_pos)).T
-        #self._waypoints_vel = np.stack((x_vel, y_vel, z_vel)).T
         self._waypoints_yaw = x_pos * 0
 
         self._acados_ocp_solver, self._ocp = create_ocp_solver(self._T_HORIZON, self._N)
@@ -342,7 +353,7 @@ class MPC_Controller(Controller):
         self._ny_e = self._nx
 
         self._tick = 0
-        self._tick_max = len(x_des) - 1 - self._N
+        self._tick_max = len(x_pos) - 1 - self._N
         self._config = config
         self._finished = False
         
@@ -375,10 +386,14 @@ class MPC_Controller(Controller):
         self.obstacles_pos = obs["obstacles_pos"]
 
         if  self.gates_visited[i_target] != obs["gates_visited"][i_target]:
+            gate_dir = Rot.from_quat(self.gates_quat[i_target]).apply([0, 1, 0])
             waypoints = [
                             x0[:3],
+                            self.gates_pos[i_target] - 0.3 * gate_dir,
                             self.gates_pos[i_target],
+                            self.gates_pos[i_target] + 0.3 * gate_dir,
                             self._waypoints_pos[i + self._N]
+
                         ]
             t_start = i * self._dt
             t_end   = t_start + self._N * self._dt
@@ -391,30 +406,33 @@ class MPC_Controller(Controller):
 
             polys = ms.generate_trajectory(
                 refs,
-                degree=13,
+                degree=12,
                 idx_minimized_orders=(3, 4),
                 num_continuous_orders=3,
                 algorithm="closed-form",
             )
                 
             sample_times = np.linspace(t_start, t_end, int((t_end - t_start) / self._dt))
-            pva = ms.compute_trajectory_derivatives(polys, sample_times, order=3)
+            states, inputs = ms.compute_quadrotor_trajectory(
+                polys,
+                sample_times,
+                vehicle_mass=MASS,
+                yaw=0.0,  # fixed yaw
+                drag_params=ms.RotorDragParameters(0.0, 0.0, 0.0),  # no drag
+            )
 
-            # Then you fill your reference arrays:
-            x_des = pva[0, :, 0]  # position x
-            y_des = pva[0, :, 1]  # position y
-            z_des = pva[0, :, 2]  # position z
+            pos_des = np.array(states[:,0:3])      # shape (T, 3)
+            thrust_des = np.array(inputs[:,0])     # shape (T, 4) [Thrust, tx, ty,tz]
+
             x_pos = self._waypoints_pos[:, 0]
             y_pos = self._waypoints_pos[:, 1]
             z_pos = self._waypoints_pos[:, 2]
-            
-            x_pos = np.concatenate((x_pos[:i], x_des, x_pos[i + self._N + 1:]))
-            y_pos = np.concatenate((y_pos[:i], y_des, y_pos[i + self._N + 1:]))
-            z_pos = np.concatenate((z_pos[:i], z_des, z_pos[i + self._N + 1:]))
-            #print(x_pos.shape)
+            x_pos = np.concatenate((x_pos[:i], pos_des[:, 0], x_pos[i + self._N + 1:], [x_pos[-1]]))
+            y_pos = np.concatenate((y_pos[:i], pos_des[:, 1], y_pos[i + self._N + 1:], [y_pos[-1]]))
+            z_pos = np.concatenate((z_pos[:i], pos_des[:, 2], z_pos[i + self._N + 1:], [z_pos[-1]]))
 
+            self._waypoints_thrust = np.concatenate((self._waypoints_thrust[:i], thrust_des, self._waypoints_thrust[i + self._N + 1:]))
             self._waypoints_pos = np.stack((x_pos, y_pos, z_pos)).T
-            #self._waypoints_vel = np.stack((x_vel, y_vel, z_vel)).T
             self._waypoints_yaw = x_pos * 0
             self.gates_visited = obs["gates_visited"]
             self.obstacles_visited = obs["obstacles_visited"]
@@ -432,14 +450,13 @@ class MPC_Controller(Controller):
             self._acados_ocp_solver.set(j, "p", params)
             yref = np.zeros(( self._ny))
             yref[0:3] = self._waypoints_pos[i + j]  # position
-            #yref[3:6] = self._waypoints_vel[i + j]  # velocity
             yref[8] = self._waypoints_yaw[i + j]  # yaw
             yref[9] = MASS * GRAVITY  # hover thrust
+            #yref[10:13] = 
             self._acados_ocp_solver.set(j, "yref", yref)
 
         yref_e = np.zeros((self._ny_e))
         yref_e[0:3] = self._waypoints_pos[i + self._N]  # position
-        #yref[3:6] = self._waypoints_vel[i + self._N]  # velocity
         yref_e[8] = self._waypoints_yaw[i + self._N]  # yaw
         self._acados_ocp_solver.set(self._N, "yref", yref_e)
 

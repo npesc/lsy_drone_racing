@@ -27,7 +27,7 @@ class ThetaStarController(Controller):
         self.t_total = 10
         self._freq = config.env.freq
         self._finished = False
-        self.resolution = 0.1
+        self.resolution = 0.05
         self.grid_size = (np.array([4, 4, 2]) / self.resolution).astype(int).tolist() # Grid size in cells
         self.grid = Grid(matrix = np.ones(self.grid_size, dtype=np.uint8))
         self.obstacles_size = [0.05, 1.4] 
@@ -194,6 +194,8 @@ class ThetaStarController(Controller):
             # Append to planned path; skip duplicate start node for intermediate segments
             if i == 0:
                 self.waypoints = np.vstack((self.current_pos, np.array(processed_path[1:])))
+            elif i == len(self.gates_pos) -1 :
+                self.waypoints = np.vstack((self.waypoints, np.array(processed_path[1:]), np.array([-0.5, -0.5, 1.1])))
             else:
                 self.waypoints = np.vstack((self.waypoints, np.array(processed_path[1:])))
 
@@ -216,7 +218,7 @@ class ThetaStarController(Controller):
         # Generate minimum snap trajectory
         self.polys = ms.generate_trajectory(
             refs,
-            degree=13,
+            degree=12,
             idx_minimized_orders=(3, 4),       # Minimize jerk and snap
             num_continuous_orders=3,           # Position, velocity, acceleration continuity
             algorithm="closed-form",           # Roy & Bry formulation
