@@ -12,3 +12,8 @@ saves
 plots/
 c_generated_code/
 Miniconda3-latest-Linux-x86_64.sh
+build/
+ppo_*/
+ppo_*.zip
+checkpoints/
+
